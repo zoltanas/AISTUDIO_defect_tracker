@@ -1,11 +1,221 @@
-<div align="center">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>God-Mode HTML to PDF Exporter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.11/html-to-image.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <style>
+        :root { --blue: #3b82f6; --bg: #0f172a; --ui: #1e293b; }
+        body { font-family: sans-serif; background: var(--bg); color: white; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        
+        /* Top Bar */
+        .toolbar { background: var(--ui); padding: 12px 20px; display: flex; gap: 20px; align-items: center; border-bottom: 1px solid #334155; z-index: 9999; }
+        .btn { padding: 10px 16px; border: none; border-radius: 4px; background: var(--blue); color: white; font-weight: bold; cursor: pointer; }
+        .btn:disabled { background: #475569; }
+        input[type="number"] { width: 70px; background: #0f172a; color: white; border: 1px solid #444; padding: 5px; }
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+        /* The Workspace */
+        #workspace { flex-grow: 1; overflow: auto; padding: 100px; display: flex; flex-direction: column; align-items: center; position: relative; }
+        
+        #render-wrapper { 
+            background: white; position: relative; box-shadow: 0 0 100px rgba(0,0,0,0.8);
+            transform-origin: top center; 
+            /* This prevents the text/iframe inside from stealing clicks */
+            user-select: none;
+        }
 
-  <h1>Built with AI Studio</h2>
+        /* The Lines - Massive Hitbox */
+        .page-break {
+            position: absolute; left: -200px; width: calc(100% + 400px); height: 80px;
+            z-index: 5000; cursor: ns-resize; display: flex; align-items: center;
+        }
+        .line-visual { width: 100%; height: 4px; background: repeating-linear-gradient(90deg, var(--blue), var(--blue) 10px, transparent 10px, transparent 20px); pointer-events: none; }
+        .line-handle { 
+            position: absolute; right: 210px; background: var(--blue); color: white; 
+            padding: 8px 15px; border-radius: 6px; font-size: 12px; font-weight: 800;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5); pointer-events: none;
+        }
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+        /* Width Handle */
+        #width-resizer { position: absolute; right: -25px; top: 0; width: 50px; height: 100%; cursor: ew-resize; z-index: 4000; }
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+        iframe { border: none; display: block; width: 100%; pointer-events: none; }
+        .loading { position: fixed; inset: 0; background: rgba(0,0,0,0.9); display: none; place-items: center; z-index: 10000; }
+    </style>
+</head>
+<body>
 
+<div class="toolbar">
+    <input type="file" id="fileIn" accept=".html">
+    <select id="orient">
+        <option value="portrait">A4 Portrait</option>
+        <option value="landscape">A4 Landscape</option>
+    </select>
+    <div>Width: <input type="number" id="wIn" value="1300"></div>
+    <div>Zoom: <input type="range" id="zIn" min="0.1" max="1" step="0.05" value="0.4"></div>
+    <button onclick="resetLayout()" class="btn" style="background:#444">Reset</button>
+    <button id="expBtn" onclick="exportPDF()" class="btn" disabled>Export PDF</button>
 </div>
+
+<div id="workspace">
+    <div id="render-wrapper" style="width: 1300px; transform: scale(0.4);">
+        <div id="html-content"></div>
+        <div id="break-layer"></div>
+        <div id="width-resizer"></div>
+    </div>
+</div>
+
+<div id="loading" class="loading">
+    <div style="text-align:center;">
+        <div style="border:5px solid #334155; border-top:5px solid #3b82f6; border-radius:50%; width:50px; height:50px; animation:spin 1s linear infinite; margin:auto;"></div>
+        <p>Generating high-fidelity layout...</p>
+    </div>
+</div>
+
+<style>@keyframes spin { 100% { transform: rotate(360deg); } }</style>
+
+<script>
+    const wrapper = document.getElementById('render-wrapper');
+    const htmlDiv = document.getElementById('html-content');
+    const breakLayer = document.getElementById('break-layer');
+    const loading = document.getElementById('loading');
+    
+    let state = {
+        zoom: 0.4,
+        width: 1300,
+        orientation: 'portrait',
+        draggingIdx: null,
+        draggingWidth: false,
+        offsets: []
+    };
+
+    const A4_RATIO = 1.4142;
+
+    // --- UI UPDATES ---
+    document.getElementById('zIn').oninput = (e) => { state.zoom = e.target.value; sync(); };
+    document.getElementById('wIn').onchange = (e) => { state.width = e.target.value; refresh(); };
+    document.getElementById('orient').onchange = (e) => { state.orientation = e.target.value; state.offsets = []; refresh(); };
+    function resetLayout() { state.offsets = []; refresh(); }
+
+    document.getElementById('fileIn').onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        loading.style.display = 'grid';
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            htmlDiv.innerHTML = `<iframe id="mainFrame" srcdoc='${ev.target.result.replace(/'/g, "&apos;")}'></iframe>`;
+            const frame = document.getElementById('mainFrame');
+            frame.onload = () => setTimeout(() => {
+                refresh();
+                loading.style.display = 'none';
+                document.getElementById('expBtn').disabled = false;
+            }, 3000);
+        };
+        reader.readAsText(file);
+    };
+
+    function sync() {
+        wrapper.style.width = state.width + 'px';
+        wrapper.style.transform = `scale(${state.zoom})`;
+    }
+
+    function refresh() {
+        const frame = document.getElementById('mainFrame');
+        if (!frame) return;
+        const b = frame.contentWindow.document.body;
+        frame.style.height = b.scrollHeight + 'px';
+        
+        breakLayer.innerHTML = '';
+        const stdH = (state.orientation === 'portrait') ? state.width * A4_RATIO : state.width / A4_RATIO;
+        
+        let curY = 0;
+        let i = 0;
+        while (curY < b.scrollHeight - 100) {
+            curY += (stdH + (state.offsets[i] || 0));
+            if (curY < b.scrollHeight) {
+                const div = document.createElement('div');
+                div.className = 'page-break';
+                div.style.top = (curY - 40) + 'px';
+                div.innerHTML = `<div class="line-visual"></div><div class="line-handle">END PAGE ${i+1}</div>`;
+                
+                const thisIdx = i;
+                div.onmousedown = (e) => { 
+                    e.preventDefault();
+                    state.draggingIdx = thisIdx; 
+                };
+                breakLayer.appendChild(div);
+            }
+            i++;
+        }
+        sync();
+    }
+
+    // --- THE FIX: GLOBAL MOUSE MANAGER ---
+    window.addEventListener('mousemove', (e) => {
+        if (state.draggingIdx === null && !state.draggingWidth) return;
+        
+        const rect = wrapper.getBoundingClientRect();
+        
+        if (state.draggingWidth) {
+            const newW = (e.clientX - rect.left) / state.zoom;
+            if (newW > 400) {
+                state.width = Math.round(newW);
+                document.getElementById('wIn').value = state.width;
+                refresh();
+            }
+        }
+
+        if (state.draggingIdx !== null) {
+            // Calculate absolute Y coordinate inside the wrapper
+            const yInWrapper = (e.clientY - rect.top) / state.zoom;
+            const stdH = (state.orientation === 'portrait') ? state.width * A4_RATIO : state.width / A4_RATIO;
+            
+            let prevY = 0;
+            for(let j = 0; j < state.draggingIdx; j++) {
+                prevY += (stdH + (state.offsets[j] || 0));
+            }
+
+            let newOffset = (yInWrapper - prevY) - stdH;
+            if (newOffset > 0) newOffset = 0; // Cap at A4 limit
+            if (stdH + newOffset < 150) newOffset = 150 - stdH; // Min height
+
+            state.offsets[state.draggingIdx] = newOffset;
+            refresh();
+        }
+    });
+
+    window.addEventListener('mouseup', () => { state.draggingIdx = null; state.draggingWidth = false; });
+    document.getElementById('width-resizer').onmousedown = (e) => { e.preventDefault(); state.draggingWidth = true; };
+
+    // --- PDF GENERATION ---
+    async function exportPDF() {
+        loading.style.display = 'grid';
+        const frame = document.getElementById('mainFrame');
+        const lines = [0, ...Array.from(document.querySelectorAll('.page-break')).map(l => parseFloat(l.style.top) + 40), frame.offsetHeight];
+        
+        const { jsPDF } = window.jspdf;
+        const pdf = new jsPDF({ orientation: state.orientation, unit: 'px', format: 'a4' });
+        const pw = pdf.internal.pageSize.getWidth();
+
+        const canvas = await htmlToImage.toCanvas(frame.contentWindow.document.body, { 
+            width: parseInt(state.width), 
+            pixelRatio: 2 
+        });
+
+        for (let k = 0; k < lines.length - 1; k++) {
+            const yS = lines[k], hV = lines[k+1] - yS;
+            const slice = document.createElement('canvas');
+            slice.width = canvas.width; slice.height = (hV / frame.offsetHeight) * canvas.height;
+            const ctx = slice.getContext('2d');
+            ctx.drawImage(canvas, 0, (yS / frame.offsetHeight) * canvas.height, canvas.width, slice.height, 0, 0, canvas.width, slice.height);
+
+            if (k > 0) pdf.addPage();
+            pdf.addImage(slice.toDataURL('image/png'), 'PNG', 0, 0, pw, (pw / slice.width) * slice.height);
+        }
+        pdf.save('Lidl_Export_Final.pdf');
+        loading.style.display = 'none';
+    }
+</script>
+</body>
+</html>
